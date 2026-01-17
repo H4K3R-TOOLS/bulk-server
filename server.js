@@ -9,10 +9,15 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const multer = require('multer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Multer for file uploads (memory storage)
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
 
 // Cloudinary Config
 cloudinary.config({
@@ -45,7 +50,109 @@ const JobStatus = {
 
 // Health Check
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', jobs: jobs.size });
+    res.json({ status: 'ok', jobs: jobs.size, memory: process.memoryUsage() });
+});
+
+// ===============================
+// HEAVY ENDPOINTS (Proxied from Main Server)
+// ===============================
+
+// Image Upload (from Android via Main Server proxy)
+app.post('/upload', upload.single('image'), async (req, res) => {
+    try {
+        const { uuid } = req.body;
+        if (!req.file) return res.status(400).json({ error: 'No file' });
+
+        const { Readable } = require('stream');
+        const uploadStream = cloudinary.uploader.upload_stream(
+            { folder: `gallery_sync/${uuid}`, resource_type: 'auto' },
+            (error, result) => {
+                if (error) return res.status(500).json({ error: error.message });
+
+                const image = {
+                    id: result.public_id,
+                    url: result.secure_url,
+                    created_at: result.created_at,
+                    resource_type: result.resource_type || 'image'
+                };
+
+                res.json({ message: 'Success', ...image });
+            }
+        );
+
+        const bufferStream = Readable.from(req.file.buffer);
+        bufferStream.pipe(uploadStream);
+
+    } catch (error) {
+        console.error("Upload Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Fetch Images from Cloudinary
+app.get('/images', async (req, res) => {
+    const { uuid } = req.query;
+    if (!uuid) return res.json([]);
+
+    try {
+        const { resources } = await cloudinary.search
+            .expression(`folder:gallery_sync/${uuid}`)
+            .sort_by('created_at', 'desc')
+            .max_results(100)
+            .execute();
+
+        res.json(resources.map(file => ({
+            id: file.public_id,
+            url: file.secure_url,
+            created_at: file.created_at,
+            resource_type: file.resource_type || 'image'
+        })));
+    } catch (error) {
+        console.error("Fetch Error:", error);
+        res.status(500).json({ error: 'Fetch failed' });
+    }
+});
+
+// Download ZIP (multiple images)
+app.post('/download-zip', async (req, res) => {
+    const { urls } = req.body;
+    if (!urls || !Array.isArray(urls)) return res.status(400).send("Invalid URLs");
+
+    try {
+        const zip = new AdmZip();
+        for (const url of urls) {
+            const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
+            const fileName = path.basename(new URL(url).pathname);
+            zip.addFile(fileName, Buffer.from(response.data));
+        }
+
+        const zipBuffer = zip.toBuffer();
+        res.set({
+            'Content-Type': 'application/zip',
+            'Content-Disposition': 'attachment; filename=gallery_download.zip'
+        });
+        res.send(zipBuffer);
+    } catch (error) {
+        console.error("ZIP Error:", error);
+        res.status(500).json({ error: 'ZIP creation failed' });
+    }
+});
+
+// Delete Images from Cloudinary
+app.post('/delete', async (req, res) => {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ error: 'No IDs provided' });
+    }
+
+    try {
+        const result = await cloudinary.api.delete_resources(ids, { resource_type: 'image' });
+        const videoResult = await cloudinary.api.delete_resources(ids, { resource_type: 'video' });
+        res.json({ message: 'Deleted successfully', result, videoResult });
+    } catch (error) {
+        console.error("Delete Error:", error);
+        res.status(500).json({ error: 'Delete failed' });
+    }
 });
 
 // Queue a bulk download job

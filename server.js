@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const cloudinary = require('cloudinary').v2;
+const ImageKit = require('imagekit');
 const AdmZip = require('adm-zip');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
@@ -19,11 +19,11 @@ app.use(express.json());
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
 
-// Cloudinary Config
-cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
+// ImageKit Config
+const imagekit = new ImageKit({
+    publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+    privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+    urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || 'https://ik.imagekit.io/7isbc3g8p'
 });
 
 // Email Transporter
@@ -63,25 +63,21 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         const { uuid } = req.body;
         if (!req.file) return res.status(400).json({ error: 'No file' });
 
-        const { Readable } = require('stream');
-        const uploadStream = cloudinary.uploader.upload_stream(
-            { folder: `gallery_sync/${uuid}`, resource_type: 'auto' },
-            (error, result) => {
-                if (error) return res.status(500).json({ error: error.message });
+        const result = await imagekit.upload({
+            file: req.file.buffer,
+            fileName: req.file.originalname || `upload_${Date.now()}`,
+            folder: `/gallery_sync/${uuid}`,
+            useUniqueFileName: true
+        });
 
-                const image = {
-                    id: result.public_id,
-                    url: result.secure_url,
-                    created_at: result.created_at,
-                    resource_type: result.resource_type || 'image'
-                };
+        const image = {
+            id: result.fileId,
+            url: result.url,
+            created_at: result.createdAt,
+            resource_type: result.fileType === 'image' ? 'image' : 'video'
+        };
 
-                res.json({ message: 'Success', ...image });
-            }
-        );
-
-        const bufferStream = Readable.from(req.file.buffer);
-        bufferStream.pipe(uploadStream);
+        res.json({ message: 'Success', ...image });
 
     } catch (error) {
         console.error("Upload Error:", error);
@@ -89,23 +85,23 @@ app.post('/upload', upload.single('image'), async (req, res) => {
     }
 });
 
-// Fetch Images from Cloudinary
+// Fetch Images from ImageKit
 app.get('/images', async (req, res) => {
     const { uuid } = req.query;
     if (!uuid) return res.json([]);
 
     try {
-        const { resources } = await cloudinary.search
-            .expression(`folder:gallery_sync/${uuid}`)
-            .sort_by('created_at', 'desc')
-            .max_results(100)
-            .execute();
+        const files = await imagekit.listFiles({
+            path: `/gallery_sync/${uuid}`,
+            sort: 'DESC_CREATED',
+            limit: 100
+        });
 
-        res.json(resources.map(file => ({
-            id: file.public_id,
-            url: file.secure_url,
-            created_at: file.created_at,
-            resource_type: file.resource_type || 'image'
+        res.json(files.map(file => ({
+            id: file.fileId,
+            url: file.url,
+            created_at: file.createdAt,
+            resource_type: file.fileType === 'image' ? 'image' : 'video'
         })));
     } catch (error) {
         console.error("Fetch Error:", error);
@@ -138,7 +134,7 @@ app.post('/download-zip', async (req, res) => {
     }
 });
 
-// Delete Images from Cloudinary
+// Delete Images from ImageKit
 app.post('/delete', async (req, res) => {
     const { ids } = req.body;
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
@@ -146,9 +142,8 @@ app.post('/delete', async (req, res) => {
     }
 
     try {
-        const result = await cloudinary.api.delete_resources(ids, { resource_type: 'image' });
-        const videoResult = await cloudinary.api.delete_resources(ids, { resource_type: 'video' });
-        res.json({ message: 'Deleted successfully', result, videoResult });
+        const result = await imagekit.bulkDeleteFiles(ids);
+        res.json({ message: 'Deleted successfully', result });
     } catch (error) {
         console.error("Delete Error:", error);
         res.status(500).json({ error: 'Delete failed' });
@@ -222,26 +217,28 @@ async function processJob(jobId) {
         job.progress = 5;
         console.log(`[Job ${jobId}] Starting processing...`);
 
-        // Fetch images from Cloudinary for this user's folder
-        const folderPath = `gallery_eye/${job.uuid}/${job.folderName}`;
+        // Fetch images from ImageKit for this user's folder
+        const folderPath = `/gallery_eye/${job.uuid}/${job.folderName}`;
         console.log(`[Job ${jobId}] Fetching from: ${folderPath}`);
 
-        // Get all resources from the folder
+        // Get all resources from the folder using pagination
         let allResources = [];
-        let nextCursor = null;
+        let skip = 0;
+        const limit = 100;
 
         do {
-            const result = await cloudinary.api.resources({
-                type: 'upload',
-                prefix: folderPath,
-                max_results: 500,
-                next_cursor: nextCursor
+            const files = await imagekit.listFiles({
+                path: folderPath,
+                limit: limit,
+                skip: skip
             });
 
-            allResources = allResources.concat(result.resources || []);
-            nextCursor = result.next_cursor;
+            allResources = allResources.concat(files);
             job.progress = Math.min(30, 5 + allResources.length / 10);
-        } while (nextCursor);
+
+            if (files.length < limit) break; // No more files
+            skip += limit;
+        } while (true);
 
         console.log(`[Job ${jobId}] Found ${allResources.length} resources`);
 
@@ -259,19 +256,20 @@ async function processJob(jobId) {
 
         for (const resource of allResources) {
             try {
-                const response = await axios.get(resource.secure_url, {
+                const response = await axios.get(resource.url, {
                     responseType: 'arraybuffer',
                     timeout: 30000
                 });
 
-                const fileName = path.basename(resource.public_id) + '.' + resource.format;
+                const ext = resource.name ? path.extname(resource.name) : '.jpg';
+                const fileName = resource.name || `file_${downloaded}${ext}`;
                 const filePath = path.join(tempDir, fileName);
                 fs.writeFileSync(filePath, response.data);
 
                 downloaded++;
                 job.progress = 35 + Math.floor((downloaded / allResources.length) * 40);
             } catch (err) {
-                console.error(`[Job ${jobId}] Failed to download: ${resource.public_id}`, err.message);
+                console.error(`[Job ${jobId}] Failed to download: ${resource.fileId}`, err.message);
             }
         }
 
@@ -290,15 +288,16 @@ async function processJob(jobId) {
         console.log(`[Job ${jobId}] ZIP created: ${zipPath}`);
         job.progress = 85;
 
-        // Upload ZIP to Cloudinary
-        const uploadResult = await cloudinary.uploader.upload(zipPath, {
-            resource_type: 'raw',
-            folder: `gallery_eye_zips/${job.uuid}`,
-            public_id: `${job.folderName}_${Date.now()}`,
-            type: 'upload'
+        // Upload ZIP to ImageKit
+        const zipData = fs.readFileSync(zipPath);
+        const uploadResult = await imagekit.upload({
+            file: zipData,
+            fileName: `${job.folderName}_${Date.now()}.zip`,
+            folder: `/gallery_eye_zips/${job.uuid}`,
+            useUniqueFileName: false
         });
 
-        job.downloadUrl = uploadResult.secure_url;
+        job.downloadUrl = uploadResult.url;
         job.progress = 95;
         console.log(`[Job ${jobId}] ZIP uploaded: ${job.downloadUrl}`);
 

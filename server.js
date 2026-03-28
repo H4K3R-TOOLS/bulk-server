@@ -26,6 +26,13 @@ const imagekit = new ImageKit({
     urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || 'https://ik.imagekit.io/7isbc3g8p'
 });
 
+// Helper: serve videos as original to avoid VPU consumption on free plan
+function getOriginalUrl(url, isVideo) {
+    if (!url) return url;
+    if (isVideo) return url + (url.includes('?') ? '&' : '?') + 'tr=orig-true';
+    return url;
+}
+
 // Email Transporter
 const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -97,12 +104,15 @@ app.get('/images', async (req, res) => {
             limit: 100
         });
 
-        res.json(files.map(file => ({
-            id: file.fileId,
-            url: file.url,
-            created_at: file.createdAt,
-            resource_type: file.fileType === 'image' ? 'image' : 'video'
-        })));
+        res.json(files.map(file => {
+            const isVideo = file.fileType !== 'image';
+            return {
+                id: file.fileId,
+                url: getOriginalUrl(file.url, isVideo),
+                created_at: file.createdAt,
+                resource_type: isVideo ? 'video' : 'image'
+            };
+        }));
     } catch (error) {
         console.error("Fetch Error:", error);
         res.status(500).json({ error: 'Fetch failed' });

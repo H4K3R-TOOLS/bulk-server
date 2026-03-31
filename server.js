@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const ImageKit = require('imagekit');
+const { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
 const AdmZip = require('adm-zip');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
@@ -19,18 +19,23 @@ app.use(express.json());
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
 
-// ImageKit Config
-const imagekit = new ImageKit({
-    publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
-    privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
-    urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || 'https://ik.imagekit.io/7isbc3g8p'
+// Cloudflare R2 Config (S3-compatible)
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || '834cdd6acb7fc24342197494945b98ae';
+const R2_BUCKET = process.env.R2_BUCKET_NAME || 'gallery';
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-5b4a6b6f87d24e218dc9dcd6a47ec39b.r2.dev';
+
+const s3 = new S3Client({
+    region: 'auto',
+    endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || ''
+    }
 });
 
-// Helper: serve videos as original to avoid VPU consumption on free plan
-function getOriginalUrl(url, isVideo) {
-    if (!url) return url;
-    if (isVideo) return url + (url.includes('?') ? '&' : '?') + 'tr=orig-true';
-    return url;
+// Helper: get public URL for a file stored in R2
+function getR2Url(key) {
+    return `${R2_PUBLIC_URL}/${key}`;
 }
 
 // Email Transporter
@@ -70,18 +75,22 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         const { uuid } = req.body;
         if (!req.file) return res.status(400).json({ error: 'No file' });
 
-        const result = await imagekit.upload({
-            file: req.file.buffer,
-            fileName: req.file.originalname || `upload_${Date.now()}`,
-            folder: `/gallery_sync/${uuid}`,
-            useUniqueFileName: true
-        });
+        const originalName = req.file.originalname || `upload_${Date.now()}`;
+        const key = `gallery_sync/${uuid}/${Date.now()}_${originalName}`;
+        const isVideo = req.file.mimetype && req.file.mimetype.startsWith('video/');
+
+        await s3.send(new PutObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: key,
+            Body: req.file.buffer,
+            ContentType: req.file.mimetype || 'image/jpeg'
+        }));
 
         const image = {
-            id: result.fileId,
-            url: result.url,
-            created_at: result.createdAt,
-            resource_type: result.fileType === 'image' ? 'image' : 'video'
+            id: key,
+            url: getR2Url(key),
+            created_at: new Date().toISOString(),
+            resource_type: isVideo ? 'video' : 'image'
         };
 
         res.json({ message: 'Success', ...image });
@@ -92,24 +101,28 @@ app.post('/upload', upload.single('image'), async (req, res) => {
     }
 });
 
-// Fetch Images from ImageKit
+// Fetch Images from R2
 app.get('/images', async (req, res) => {
     const { uuid } = req.query;
     if (!uuid) return res.json([]);
 
     try {
-        const files = await imagekit.listFiles({
-            path: `/gallery_sync/${uuid}`,
-            sort: 'DESC_CREATED',
-            limit: 100
-        });
+        const prefix = `gallery_sync/${uuid}/`;
+        const response = await s3.send(new ListObjectsV2Command({
+            Bucket: R2_BUCKET,
+            Prefix: prefix,
+            MaxKeys: 100
+        }));
+
+        const files = (response.Contents || []).sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
         res.json(files.map(file => {
-            const isVideo = file.fileType !== 'image';
+            const ext = path.extname(file.Key || '').toLowerCase();
+            const isVideo = ['.mp4', '.mov', '.avi', '.webm', '.mkv'].includes(ext);
             return {
-                id: file.fileId,
-                url: getOriginalUrl(file.url, isVideo),
-                created_at: file.createdAt,
+                id: file.Key,
+                url: getR2Url(file.Key),
+                created_at: file.LastModified,
                 resource_type: isVideo ? 'video' : 'image'
             };
         }));
@@ -144,7 +157,7 @@ app.post('/download-zip', async (req, res) => {
     }
 });
 
-// Delete Images from ImageKit
+// Delete Images from R2
 app.post('/delete', async (req, res) => {
     const { ids } = req.body;
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
@@ -152,7 +165,14 @@ app.post('/delete', async (req, res) => {
     }
 
     try {
-        const result = await imagekit.bulkDeleteFiles(ids);
+        const deleteParams = {
+            Bucket: R2_BUCKET,
+            Delete: {
+                Objects: ids.map(id => ({ Key: id })),
+                Quiet: true
+            }
+        };
+        const result = await s3.send(new DeleteObjectsCommand(deleteParams));
         res.json({ message: 'Deleted successfully', result });
     } catch (error) {
         console.error("Delete Error:", error);
@@ -227,28 +247,31 @@ async function processJob(jobId) {
         job.progress = 5;
         console.log(`[Job ${jobId}] Starting processing...`);
 
-        // Fetch images from ImageKit for this user's folder
-        const folderPath = `/gallery_eye/${job.uuid}/${job.folderName}`;
-        console.log(`[Job ${jobId}] Fetching from: ${folderPath}`);
+        // Fetch files from R2 for this user's folder
+        const prefix = `gallery_eye/${job.uuid}/${job.folderName}/`;
+        console.log(`[Job ${jobId}] Fetching from: ${prefix}`);
 
-        // Get all resources from the folder using pagination
+        // Get all resources from R2 using pagination
         let allResources = [];
-        let skip = 0;
-        const limit = 100;
+        let continuationToken = undefined;
 
         do {
-            const files = await imagekit.listFiles({
-                path: folderPath,
-                limit: limit,
-                skip: skip
-            });
+            const params = {
+                Bucket: R2_BUCKET,
+                Prefix: prefix,
+                MaxKeys: 1000,
+            };
+            if (continuationToken) {
+                params.ContinuationToken = continuationToken;
+            }
 
+            const response = await s3.send(new ListObjectsV2Command(params));
+            const files = response.Contents || [];
             allResources = allResources.concat(files);
             job.progress = Math.min(30, 5 + allResources.length / 10);
 
-            if (files.length < limit) break; // No more files
-            skip += limit;
-        } while (true);
+            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+        } while (continuationToken);
 
         console.log(`[Job ${jobId}] Found ${allResources.length} resources`);
 
@@ -260,26 +283,26 @@ async function processJob(jobId) {
         const tempDir = path.join(os.tmpdir(), `bulk_${jobId}`);
         fs.mkdirSync(tempDir, { recursive: true });
 
-        // Download all images
+        // Download all files
         job.progress = 35;
         let downloaded = 0;
 
         for (const resource of allResources) {
             try {
-                const response = await axios.get(resource.url, {
+                const fileUrl = getR2Url(resource.Key);
+                const response = await axios.get(fileUrl, {
                     responseType: 'arraybuffer',
                     timeout: 30000
                 });
 
-                const ext = resource.name ? path.extname(resource.name) : '.jpg';
-                const fileName = resource.name || `file_${downloaded}${ext}`;
+                const fileName = path.basename(resource.Key);
                 const filePath = path.join(tempDir, fileName);
                 fs.writeFileSync(filePath, response.data);
 
                 downloaded++;
                 job.progress = 35 + Math.floor((downloaded / allResources.length) * 40);
             } catch (err) {
-                console.error(`[Job ${jobId}] Failed to download: ${resource.fileId}`, err.message);
+                console.error(`[Job ${jobId}] Failed to download: ${resource.Key}`, err.message);
             }
         }
 
@@ -288,8 +311,8 @@ async function processJob(jobId) {
 
         // Create ZIP
         const zip = new AdmZip();
-        const files = fs.readdirSync(tempDir);
-        for (const file of files) {
+        const localFiles = fs.readdirSync(tempDir);
+        for (const file of localFiles) {
             zip.addLocalFile(path.join(tempDir, file));
         }
 
@@ -298,16 +321,18 @@ async function processJob(jobId) {
         console.log(`[Job ${jobId}] ZIP created: ${zipPath}`);
         job.progress = 85;
 
-        // Upload ZIP to ImageKit
+        // Upload ZIP to R2
         const zipData = fs.readFileSync(zipPath);
-        const uploadResult = await imagekit.upload({
-            file: zipData,
-            fileName: `${job.folderName}_${Date.now()}.zip`,
-            folder: `/gallery_eye_zips/${job.uuid}`,
-            useUniqueFileName: false
-        });
+        const zipKey = `gallery_eye_zips/${job.uuid}/${job.folderName}_${Date.now()}.zip`;
 
-        job.downloadUrl = uploadResult.url;
+        await s3.send(new PutObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: zipKey,
+            Body: zipData,
+            ContentType: 'application/zip'
+        }));
+
+        job.downloadUrl = getR2Url(zipKey);
         job.progress = 95;
         console.log(`[Job ${jobId}] ZIP uploaded: ${job.downloadUrl}`);
 

@@ -108,17 +108,28 @@ app.get('/images', async (req, res) => {
 
     try {
         const prefix = `gallery_sync/${uuid}/`;
-        const response = await s3.send(new ListObjectsV2Command({
-            Bucket: R2_BUCKET,
-            Prefix: prefix,
-            MaxKeys: 100
-        }));
+        let allFiles = [];
+        let continuationToken = undefined;
 
-        const files = (response.Contents || []).sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+        // Paginate through all R2 objects
+        do {
+            const params = {
+                Bucket: R2_BUCKET,
+                Prefix: prefix,
+                MaxKeys: 1000
+            };
+            if (continuationToken) params.ContinuationToken = continuationToken;
+
+            const response = await s3.send(new ListObjectsV2Command(params));
+            if (response.Contents) allFiles.push(...response.Contents);
+            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+        } while (continuationToken);
+
+        const files = allFiles.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
         res.json(files.map(file => {
             const ext = path.extname(file.Key || '').toLowerCase();
-            const isVideo = ['.mp4', '.mov', '.avi', '.webm', '.mkv'].includes(ext);
+            const isVideo = ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.3gp'].includes(ext);
             return {
                 id: file.Key,
                 url: getR2Url(file.Key),

@@ -127,16 +127,28 @@ app.get('/images', async (req, res) => {
 
         const files = allFiles.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
-        res.json(files.map(file => {
-            const ext = path.extname(file.Key || '').toLowerCase();
-            const isVideo = ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.3gp'].includes(ext);
-            return {
-                id: file.Key,
-                url: getR2Url(file.Key),
-                created_at: file.LastModified,
-                resource_type: isVideo ? 'video' : 'image'
-            };
-        }));
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const start = (page - 1) * limit;
+        const paged = files.slice(start, start + limit);
+
+        res.json({
+            items: paged.map(file => {
+                const ext = path.extname(file.Key || '').toLowerCase();
+                const isVideo = ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.3gp'].includes(ext);
+                const isZip = ext === '.zip';
+                return {
+                    id: file.Key,
+                    url: getR2Url(file.Key),
+                    created_at: file.LastModified,
+                    resource_type: isVideo ? 'video' : isZip ? 'zip' : 'image',
+                    name: path.basename(file.Key || '')
+                };
+            }),
+            total: files.length,
+            page,
+            hasMore: start + limit < files.length
+        });
     } catch (error) {
         console.error("Fetch Error:", error);
         res.status(500).json({ error: 'Fetch failed' });

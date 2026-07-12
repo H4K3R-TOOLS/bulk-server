@@ -211,6 +211,57 @@ app.get('/camera', async (req, res) => {
     }
 });
 
+app.get('/voice', async (req, res) => {
+    const { uuid, deviceId } = req.query;
+    if (!uuid) return res.json([]);
+
+    try {
+        const deviceFolder = deviceId ? `${deviceId}/` : '';
+        const prefix = `voice_sync/${uuid}/${deviceFolder}`;
+        let allFiles = [];
+        let continuationToken = undefined;
+
+        // Paginate through all R2 objects
+        do {
+            const params = {
+                Bucket: R2_BUCKET,
+                Prefix: prefix,
+                MaxKeys: 1000
+            };
+            if (continuationToken) params.ContinuationToken = continuationToken;
+
+            const response = await s3.send(new ListObjectsV2Command(params));
+            if (response.Contents) allFiles.push(...response.Contents);
+            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+        } while (continuationToken);
+
+        const files = allFiles.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const start = (page - 1) * limit;
+        const paged = files.slice(start, start + limit);
+
+        res.json({
+            items: paged.map(file => {
+                return {
+                    id: file.Key,
+                    url: getR2Url(file.Key),
+                    created_at: file.LastModified,
+                    resource_type: 'audio',
+                    name: path.basename(file.Key || '')
+                };
+            }),
+            total: files.length,
+            page,
+            hasMore: start + limit < files.length
+        });
+    } catch (error) {
+        console.error("Voice Fetch Error:", error);
+        res.status(500).json({ error: 'Fetch failed' });
+    }
+});
+
 // Download ZIP (multiple images)
 app.post('/download-zip', async (req, res) => {
     const { urls } = req.body;

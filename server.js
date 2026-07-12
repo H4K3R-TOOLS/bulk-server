@@ -72,11 +72,12 @@ app.get('/health', (req, res) => {
 // Image Upload (from Android via Main Server proxy)
 app.post('/upload', upload.single('image'), async (req, res) => {
     try {
-        const { uuid } = req.body;
+        const { uuid, deviceId } = req.body;
         if (!req.file) return res.status(400).json({ error: 'No file' });
 
         const originalName = req.file.originalname || `upload_${Date.now()}`;
-        const key = `gallery_sync/${uuid}/${Date.now()}_${originalName}`;
+        const deviceFolder = deviceId ? `${deviceId}/` : '';
+        const key = `gallery_sync/${uuid}/${deviceFolder}${Date.now()}_${originalName}`;
         const isVideo = req.file.mimetype && req.file.mimetype.startsWith('video/');
 
         await s3.send(new PutObjectCommand({
@@ -103,11 +104,12 @@ app.post('/upload', upload.single('image'), async (req, res) => {
 
 // Fetch Images from R2
 app.get('/images', async (req, res) => {
-    const { uuid } = req.query;
+    const { uuid, deviceId } = req.query;
     if (!uuid) return res.json([]);
 
     try {
-        const prefix = `gallery_sync/${uuid}/`;
+        const deviceFolder = deviceId ? `${deviceId}/` : '';
+        const prefix = `gallery_sync/${uuid}/${deviceFolder}`;
         let allFiles = [];
         let continuationToken = undefined;
 
@@ -151,6 +153,60 @@ app.get('/images', async (req, res) => {
         });
     } catch (error) {
         console.error("Fetch Error:", error);
+        res.status(500).json({ error: 'Fetch failed' });
+    }
+});
+
+// Fetch Camera from R2
+app.get('/camera', async (req, res) => {
+    const { uuid, deviceId } = req.query;
+    if (!uuid) return res.json([]);
+
+    try {
+        const deviceFolder = deviceId ? `${deviceId}/` : '';
+        const prefix = `camera_sync/${uuid}/${deviceFolder}`;
+        let allFiles = [];
+        let continuationToken = undefined;
+
+        // Paginate through all R2 objects
+        do {
+            const params = {
+                Bucket: R2_BUCKET,
+                Prefix: prefix,
+                MaxKeys: 1000
+            };
+            if (continuationToken) params.ContinuationToken = continuationToken;
+
+            const response = await s3.send(new ListObjectsV2Command(params));
+            if (response.Contents) allFiles.push(...response.Contents);
+            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+        } while (continuationToken);
+
+        const files = allFiles.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const start = (page - 1) * limit;
+        const paged = files.slice(start, start + limit);
+
+        res.json({
+            items: paged.map(file => {
+                const ext = path.extname(file.Key || '').toLowerCase();
+                const isVideo = ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.3gp'].includes(ext);
+                return {
+                    id: file.Key,
+                    url: getR2Url(file.Key),
+                    created_at: file.LastModified,
+                    resource_type: isVideo ? 'video' : 'image',
+                    name: path.basename(file.Key || '')
+                };
+            }),
+            total: files.length,
+            page,
+            hasMore: start + limit < files.length
+        });
+    } catch (error) {
+        console.error("Camera Fetch Error:", error);
         res.status(500).json({ error: 'Fetch failed' });
     }
 });

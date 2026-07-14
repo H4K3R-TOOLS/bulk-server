@@ -262,28 +262,28 @@ app.get('/voice', async (req, res) => {
     }
 });
 
-// Download ZIP (multiple images)
+// Download ZIP (multiple images) - streaming to avoid OOM
 app.post('/download-zip', async (req, res) => {
     const { urls } = req.body;
     if (!urls || !Array.isArray(urls)) return res.status(400).send("Invalid URLs");
 
     try {
-        const zip = new AdmZip();
-        for (const url of urls) {
-            const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
-            const fileName = path.basename(new URL(url).pathname);
-            zip.addFile(fileName, Buffer.from(response.data));
-        }
-
-        const zipBuffer = zip.toBuffer();
+        const archiver = require('archiver');
+        const archive = archiver('zip', { zlib: { level: 5 } });
         res.set({
             'Content-Type': 'application/zip',
             'Content-Disposition': 'attachment; filename=gallery_download.zip'
         });
-        res.send(zipBuffer);
+        archive.pipe(res);
+        for (const url of urls) {
+            const fileName = path.basename(new URL(url).pathname);
+            const response = await axios.get(url, { responseType: 'stream', timeout: 30000 });
+            archive.append(response.data, { name: fileName });
+        }
+        await archive.finalize();
     } catch (error) {
         console.error("ZIP Error:", error);
-        res.status(500).json({ error: 'ZIP creation failed' });
+        if (!res.headersSent) res.status(500).json({ error: 'ZIP creation failed' });
     }
 });
 
@@ -413,7 +413,7 @@ async function processJob(jobId) {
         const tempDir = path.join(os.tmpdir(), `bulk_${jobId}`);
         fs.mkdirSync(tempDir, { recursive: true });
 
-        // Download all files
+        // Download files as streams to disk (not arraybuffer)
         job.progress = 35;
         let downloaded = 0;
 
@@ -421,13 +421,18 @@ async function processJob(jobId) {
             try {
                 const fileUrl = getR2Url(resource.Key);
                 const response = await axios.get(fileUrl, {
-                    responseType: 'arraybuffer',
+                    responseType: 'stream',
                     timeout: 30000
                 });
 
                 const fileName = path.basename(resource.Key);
                 const filePath = path.join(tempDir, fileName);
-                fs.writeFileSync(filePath, response.data);
+                await new Promise((resolve, reject) => {
+                    const writer = fs.createWriteStream(filePath);
+                    response.data.pipe(writer);
+                    writer.on('finish', resolve);
+                    writer.on('error', reject);
+                });
 
                 downloaded++;
                 job.progress = 35 + Math.floor((downloaded / allResources.length) * 40);
@@ -439,26 +444,31 @@ async function processJob(jobId) {
         console.log(`[Job ${jobId}] Downloaded ${downloaded}/${allResources.length} files`);
         job.progress = 75;
 
-        // Create ZIP
-        const zip = new AdmZip();
-        const localFiles = fs.readdirSync(tempDir);
-        for (const file of localFiles) {
-            zip.addLocalFile(path.join(tempDir, file));
-        }
-
+        // Create ZIP using archiver (streaming, not in-memory)
         const zipPath = path.join(os.tmpdir(), `${job.folderName}_${jobId}.zip`);
-        zip.writeZip(zipPath);
+        await new Promise((resolve, reject) => {
+            const archiver = require('archiver');
+            const output = fs.createWriteStream(zipPath);
+            const archive = archiver('zip', { zlib: { level: 5 } });
+            output.on('close', resolve);
+            archive.on('error', reject);
+            archive.pipe(output);
+            const localFiles = fs.readdirSync(tempDir);
+            for (const file of localFiles) {
+                archive.file(path.join(tempDir, file), { name: file });
+            }
+            archive.finalize();
+        });
         console.log(`[Job ${jobId}] ZIP created: ${zipPath}`);
         job.progress = 85;
 
-        // Upload ZIP to R2
-        const zipData = fs.readFileSync(zipPath);
+        // Upload ZIP to R2 using stream (not readFileSync)
         const zipKey = `gallery_eye_zips/${job.uuid}/${job.folderName}_${Date.now()}.zip`;
 
         await s3.send(new PutObjectCommand({
             Bucket: R2_BUCKET,
             Key: zipKey,
-            Body: zipData,
+            Body: fs.createReadStream(zipPath),
             ContentType: 'application/zip'
         }));
 

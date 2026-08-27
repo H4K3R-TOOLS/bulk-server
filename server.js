@@ -19,23 +19,31 @@ app.use(express.json());
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
 
-// Cloudflare R2 Config (S3-compatible)
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || '834cdd6acb7fc24342197494945b98ae';
-const R2_BUCKET = process.env.R2_BUCKET_NAME || 'gallery';
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-5b4a6b6f87d24e218dc9dcd6a47ec39b.r2.dev';
+// Storage Config (AWS S3 & Cloudflare R2 compatible)
+const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+const S3_BUCKET = process.env.AWS_BUCKET_NAME || process.env.R2_BUCKET_NAME || 'spynox-media-vault-2026';
+const S3_ACCESS_KEY = process.env.AWS_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || 'AKIAW6F55NYVSLUQLSA3';
+const S3_SECRET_KEY = process.env.AWS_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || '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';
+const S3_ENDPOINT = process.env.S3_ENDPOINT || (process.env.R2_ACCOUNT_ID ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : undefined);
+const S3_PUBLIC_URL = process.env.S3_PUBLIC_URL || process.env.CLOUDFRONT_URL || process.env.R2_PUBLIC_URL || `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com`;
+const R2_BUCKET = S3_BUCKET;
 
-const s3 = new S3Client({
-    region: 'auto',
-    endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+const s3ClientConfig = {
+    region: AWS_REGION,
     credentials: {
-        accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
-        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || ''
+        accessKeyId: S3_ACCESS_KEY,
+        secretAccessKey: S3_SECRET_KEY
     }
-});
+};
+if (S3_ENDPOINT) {
+    s3ClientConfig.endpoint = S3_ENDPOINT;
+}
 
-// Helper: get public URL for a file stored in R2
+const s3 = new S3Client(s3ClientConfig);
+
+// Helper: get public URL for a file stored in S3 / R2
 function getR2Url(key) {
-    return `${R2_PUBLIC_URL}/${key}`;
+    return `${S3_PUBLIC_URL}/${key}`;
 }
 
 // Email Transporter
@@ -377,33 +385,36 @@ async function processJob(jobId) {
         job.progress = 5;
         console.log(`[Job ${jobId}] Starting processing...`);
 
-        // Fetch files from R2 for this user's folder
-        const prefix = `gallery_eye/${job.uuid}/${job.folderName}/`;
-        console.log(`[Job ${jobId}] Fetching from: ${prefix}`);
-
-        // Get all resources from R2 using pagination
+        // Fetch files from S3/R2 for this user's folder (support both gallery_sync and gallery_eye namespaces)
+        const prefixesToTry = [
+            `gallery_sync/${job.uuid}/${job.folderName}/`,
+            `gallery_eye/${job.uuid}/${job.folderName}/`,
+            `gallery_sync/${job.uuid}/`
+        ];
+        
         let allResources = [];
-        let continuationToken = undefined;
+        for (const prefix of prefixesToTry) {
+            let continuationToken = undefined;
+            do {
+                const params = {
+                    Bucket: R2_BUCKET,
+                    Prefix: prefix,
+                    MaxKeys: 1000,
+                };
+                if (continuationToken) params.ContinuationToken = continuationToken;
 
-        do {
-            const params = {
-                Bucket: R2_BUCKET,
-                Prefix: prefix,
-                MaxKeys: 1000,
-            };
-            if (continuationToken) {
-                params.ContinuationToken = continuationToken;
+                const response = await s3.send(new ListObjectsV2Command(params));
+                const files = response.Contents || [];
+                allResources = allResources.concat(files);
+                continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+            } while (continuationToken);
+
+            if (allResources.length > 0) {
+                console.log(`[Job ${jobId}] Found ${allResources.length} resources under prefix: ${prefix}`);
+                break;
             }
-
-            const response = await s3.send(new ListObjectsV2Command(params));
-            const files = response.Contents || [];
-            allResources = allResources.concat(files);
-            job.progress = Math.min(30, 5 + allResources.length / 10);
-
-            continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
-        } while (continuationToken);
-
-        console.log(`[Job ${jobId}] Found ${allResources.length} resources`);
+        }
+        job.progress = Math.min(30, 5 + allResources.length / 10);
 
         if (allResources.length === 0) {
             throw new Error('No images found in folder');
